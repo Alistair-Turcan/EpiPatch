@@ -92,18 +92,21 @@ class ATMGNN(BaseModel):
         Each slice along the second dimension corresponds to a timestep, with each column representing a node.
     """
     def __init__(self, 
-                num_nodes,
-                num_features,
                 num_timesteps_input,
                 num_timesteps_output,
+                adj_m = None,
+                num_nodes = None,
+                num_features = 1,
                 nhid = 256,
                 dropout = 0.5,
                 nhead = 1, 
                 num_clusters = [10, 5], 
-                use_norm = False):
+                use_norm = False,
+                **kwargs):
         
         super(ATMGNN, self).__init__()
-        
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.window = num_timesteps_input
         self.nout = num_timesteps_output
         self.n_nodes = num_nodes

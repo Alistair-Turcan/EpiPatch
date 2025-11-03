@@ -113,8 +113,10 @@ class AGCRN(BaseModel):
     Task: Spatial-Temporal Forecasting
     """
 
-    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m, num_features = 1, rnn_units = 64, nlayers = 2, embed_dim = 10, cheb_k = 2, device="cpu"):
+    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m = None, num_nodes = None, num_features = 1,rnn_units = 64, nlayers = 2, embed_dim = 10, cheb_k = 2, device="cpu", **kwargs):
         super(AGCRN, self).__init__(device=device)
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         num_nodes = adj_m.shape[0]
         self.device = device
         self.num_node = num_nodes

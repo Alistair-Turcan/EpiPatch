@@ -371,6 +371,8 @@ class DCRNN(BaseModel, Seq2SeqAttrs):
         A tensor of shape (batch_size, num_nodes, horizon), representing the predicted values for each node over future timesteps.
     """
     def __init__(self,
+              adj_m = None,
+              num_nodes = None,
               num_features=1,
               num_timesteps_input=5,
               num_classes=1,
@@ -381,7 +383,8 @@ class DCRNN(BaseModel, Seq2SeqAttrs):
               rnn_units=1,
               nonlinearity="tanh",
               dropout=0,
-              device="cpu"):
+              device="cpu",
+              **kwargs):
 
         super().__init__()
         Seq2SeqAttrs.__init__(self, max_diffusion_step=max_diffusion_step, filter_type=filter_type,
@@ -465,23 +468,23 @@ class DCRNN(BaseModel, Seq2SeqAttrs):
             representing the predicted values for each node over the specified output timesteps.
         """
         
-        inputs = X_batch
+        # inputs = X_batch
         batch_size = X_batch.shape[0] #data.batch[-1] + 1
         
-        # reshape geometric dataloader format to real format
-        '''num_graphs = data.num_graphs
-        individual_graphs = []
-        for i in range(num_graphs):
-            mask = data.batch == i
-            node_features = data.x[mask]
-            individual_graphs.append(node_features)
-            adj_m = data.adj_m[mask]
-        new_inputs = torch.stack(individual_graphs, dim=0)'''
+        # # reshape geometric dataloader format to real format
+        # '''num_graphs = data.num_graphs
+        # individual_graphs = []
+        # for i in range(num_graphs):
+        #     mask = data.batch == i
+        #     node_features = data.x[mask]
+        #     individual_graphs.append(node_features)
+        #     adj_m = data.adj_m[mask]
+        # new_inputs = torch.stack(individual_graphs, dim=0)'''
         
-        inputs = torch.permute(inputs,(2, 0, 1, 3))
-        inputs = torch.reshape(inputs, (inputs.shape[0], inputs.shape[1], 
-                                            inputs.shape[2]*inputs.shape[3]))
-        
+        # inputs = torch.permute(inputs,(2, 0, 1, 3))
+        # inputs = torch.reshape(inputs, (inputs.shape[0], inputs.shape[1], 
+        #                                     inputs.shape[2]*inputs.shape[3]))
+        inputs = X_batch.permute(1, 0, 2, 3).contiguous().view(X_batch.size(1), X_batch.size(0), -1)
         
         num_nodes = graph.shape[0]
         encoder_hidden_state = self.encoder(inputs, graph, num_nodes)
@@ -489,7 +492,7 @@ class DCRNN(BaseModel, Seq2SeqAttrs):
         
         outputs = torch.reshape(outputs, (self.num_timesteps_output, batch_size, 
                                             num_nodes, self.num_classes))
-        outputs = torch.permute(outputs, (1, 2, 0, 3)).squeeze(-1)
+        outputs = torch.permute(outputs, (1, 0, 2, 3)).squeeze(-1)
         #outputs = torch.reshape(outputs, (-1, outputs.shape[2], outputs.shape[3]))
         return outputs
     

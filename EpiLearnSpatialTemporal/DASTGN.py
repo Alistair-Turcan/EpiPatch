@@ -324,16 +324,19 @@ class DASTGN(BaseModel):
         A tensor of shape (batch_size, num_timesteps_output, num_nodes), representing the predicted values for each node over future timesteps.
         Each slice along the second dimension corresponds to a timestep, with each column representing a node.
     """
-    def __init__(self, 
-                num_nodes,
-                num_features,
+    def __init__(self,
                 num_timesteps_input,
                 num_timesteps_output,
+                adj_m = None,
+                num_nodes = None,
+                num_features = 1,
                 GNN_layers = 2,
                 nhids = None,
-                device = 'cpu'):
+                device = 'cpu',
+                **kwargs):
         super(DASTGN, self).__init__(device=device)
-
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.device = device
         self.num_timestamps = num_timesteps_input
         self.input_size = num_features

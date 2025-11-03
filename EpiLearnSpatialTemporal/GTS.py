@@ -308,7 +308,8 @@ class GTS(BaseModel, Seq2SeqAttrs):
         self,
         num_timesteps_input,
         num_timesteps_output,
-        adj_m,
+        adj_m = None,
+        num_nodes = None,
         rnn_units=64,
         max_diffusion_step=2,
         cl_decay_steps=1000,
@@ -320,9 +321,11 @@ class GTS(BaseModel, Seq2SeqAttrs):
         node_feats=None,
         temp=0.5,
         k=5,
-        device="cpu"
+        device="cpu",
+        **kwargs
     ):
-        num_nodes = adj_m.shape[0]
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         seq_len = num_timesteps_input
         horizon = num_timesteps_output
         super(GTS, self).__init__(device=device)

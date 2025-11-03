@@ -151,8 +151,9 @@ class STGCN(BaseModel):
     num_features).
     """
 
-    def __init__(self, num_nodes, num_features, num_timesteps_input,
-                 num_timesteps_output, nhids = 128, device='cpu', **kwargs):
+    def __init__(self, num_timesteps_input, num_timesteps_output,
+                 adj_m = None, num_nodes = None, num_features = 1,
+                 nhids = 128, device='cpu', **kwargs):
         """
         :param num_nodes: Number of nodes in the graph.
         :param num_features: Number of features at each node in each time step.
@@ -164,6 +165,8 @@ class STGCN(BaseModel):
         self.nhid = nhids
         self.spatial_nhid = nhids
         super(STGCN, self).__init__(device=device)
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.block1 = STGCNBlock(in_channels=num_features, out_channels=self.nhid,
                                  spatial_channels=self.spatial_nhid, num_nodes=num_nodes).to(self.device)
         self.block2 = STGCNBlock(in_channels=self.nhid, out_channels=self.nhid,
@@ -197,7 +200,7 @@ class STGCN(BaseModel):
         # # import ipdb; ipdb.set_trace()
         # out5 = self.fully(out4.reshape((out4.shape[0], out4.shape[1], -1)))
         # return out5
-
+        X = X.permute(0, 2, 1, 3).contiguous()
         # import ipdb; ipdb.set_trace()
         adj.diagonal().fill_(1)
         # import ipdb; ipdb.set_trace()
@@ -206,6 +209,7 @@ class STGCN(BaseModel):
         final = self.last_temporal(out2)
         # import ipdb; ipdb.set_trace()
         output = self.fully(final.reshape((final.shape[0], final.shape[1], -1)))
+        output = output.permute(0, 2, 1).contiguous()
         return output
 
                 # import ipdb; ipdb.set_trace()

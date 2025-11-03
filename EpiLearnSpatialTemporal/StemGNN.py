@@ -115,9 +115,10 @@ class StemGNN(BaseModel):
         - The experimental setting is not fair in StemGNN, and we can not reproduce the paper's performance.
     """
 
-    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m, stack_cnt=2, multi_layer=5, dropout_rate=0.5, leaky_rate=0.2, device="cpu"):
+    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m=None, num_nodes=None, stack_cnt=2, multi_layer=5, dropout_rate=0.5, leaky_rate=0.2, device="cpu", **kwargs):
         super(StemGNN, self).__init__(device=device)
-        num_nodes = adj_m.shape[0]
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.num_nodes = num_nodes
         self.stack_cnt = stack_cnt
         self.alpha = leaky_rate

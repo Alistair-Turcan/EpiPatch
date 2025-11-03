@@ -74,19 +74,23 @@ class EpiColaGNN(BaseModel):
         A tensor of shape (batch_size, num_timesteps_output, num_nodes), representing the predicted values for each node over future timesteps.
         Each slice along the second dimension corresponds to a timestep, with each column representing a node.
     """
-    def __init__(self, 
-                num_nodes,
-                num_features,
+    def __init__(self,
                 num_timesteps_input,
                 num_timesteps_output,
+                adj_m = None,
+                num_nodes = None,
+                num_features = 1,
                 nhid=32,
                 rnn_model = 'GRU',
                 n_layer = 1,
                 bidirect = False,
                 target_idx=0,
                 dropout = 0.5,
-                device='cpu'): 
+                device='cpu',
+                **kwargs): 
         super().__init__()
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.device = device
         self.x_h = num_features 
         self.m = num_nodes

@@ -343,11 +343,12 @@ class MTGNN(BaseModel):
     Task: Spatial-Temporal Forecasting
     """
 
-    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m, num_features=1, gcn_true=True, buildA_true=True, gcn_depth=2, static_feat=None, dropout=0.3, subgraph_size=20, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True, device="cpu"):
+    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m=None, num_nodes=None, num_features=1, gcn_true=True, buildA_true=True, gcn_depth=2, static_feat=None, dropout=0.3, subgraph_size=20, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True, device="cpu", **kwargs):
         super(MTGNN, self).__init__(device=device)
         seq_length = num_timesteps_input
         out_dim = num_timesteps_output
-        num_nodes = adj_m.shape[0]
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         in_dim = num_features
         self.gcn_true = gcn_true
         self.buildA_true = buildA_true

@@ -1019,13 +1019,15 @@ class MultiViewFusion(nn.Module):
         return fusion_output, attn_weights
 
 class EARTH(BaseModel):
-    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output, dropout, n_hidden, adj, dtw_matrix, device): 
+    def __init__(self, num_timesteps_input, num_timesteps_output, dtw_matrix, adj_m=None, num_nodes=None, num_features=1, dropout=0.2, n_hidden=20, device="cpu", **kwargs): 
         super(EARTH, self).__init__()
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.x_h = num_features # 1
         self.m = num_nodes
         self.w = num_timesteps_input
         self.h = num_timesteps_output
-        self.adj = adj
+        self.adj = adj_m
         #adj转换为edge_index
         self.o_adj = self.adj
         rowsum = 1. / torch.sqrt(self.adj.sum(dim=0))

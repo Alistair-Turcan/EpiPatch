@@ -182,10 +182,11 @@ class EpiGNN(BaseModel):
         Each slice along the second dimension corresponds to a timestep, with each column representing a node.
     """
     def __init__(self, 
-                num_nodes, 
-                num_features, 
                 num_timesteps_input,
                 num_timesteps_output, 
+                adj_m = None,
+                num_nodes = None,
+                num_features = 1,
                 k = 8, 
                 hidA = 128, 
                 hidR = 32, 
@@ -193,9 +194,12 @@ class EpiGNN(BaseModel):
                 n_layer = 2, 
                 dropout = 0, 
                 nhids=None,
-                device = 'cpu'):
+                device = 'cpu',
+                **kwargs):
         super().__init__(device)
         # arguments setting
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
         self.nfeat = num_features
         self.m = num_nodes
         self.w = num_timesteps_input
@@ -371,7 +375,7 @@ class EpiGNN(BaseModel):
             z = self.highway(z)
             z = z.view(-1, self.m)
             res = res + z
-        
+        res = res.permute(0, 2, 1).contiguous()
 
         # import ipdb; ipdb.set_trace()
 
