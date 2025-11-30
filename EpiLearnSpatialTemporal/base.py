@@ -9,12 +9,43 @@ import matplotlib.pyplot as plt
 from .utils import *
 from .metrics import get_loss
 
+class _FutureTI(nn.Module):
+    def __init__(self, tid_sizes, emb_dim=4, hidden=(16,), node_specific=True, num_nodes=None):
+        super().__init__()
+        self.keys = list(tid_sizes.keys()) if tid_sizes else []
+        self.node_specific = node_specific
+        self.num_nodes = num_nodes
+        self.embs = nn.ModuleDict({k: nn.Linear(K, emb_dim, bias=False) for k, K in tid_sizes.items()})
+        self.total_dim = emb_dim * len(self.keys)
+
+        def mlp(din, dout):
+            layers, d = [], din
+            for h in hidden: layers += [nn.Linear(d, h), nn.ReLU()]; d = h
+            layers.append(nn.Linear(d, dout)); return nn.Sequential(*layers)
+
+        self.head = mlp(self.total_dim, num_nodes if node_specific else 1)
+        if node_specific: assert num_nodes is not None, "num_nodes is required when node_specific=True"
+
+    def forward(self, states_future):
+        if states_future is None or states_future.numel() == 0 or not self.keys:
+            return None
+        B, H, C = states_future.shape
+        outs = []
+        for ch, k in enumerate(self.keys):
+            K = self.embs[k].in_features
+            idx = states_future[..., ch].long()
+            oh = F.one_hot(idx.clamp_min(0).clamp_max(K-1), K).float()
+            outs.append(self.embs[k](oh))          # [B,H,emb]
+        z = torch.cat(outs, dim=-1)                # [B,H,D]
+        return self.head(z)                        # [B,H,N] or [B,H,1]
 
 class BaseModel(nn.Module):
-    def __init__(self, device = 'cpu'):
+    def __init__(self, device = 'cpu', 
+                 use_future_ti=False, tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, num_nodes=None):
         super(BaseModel, self).__init__()
         self.device = device
-
+        self.future_ti = _FutureTI(tid_sizes, emb_dim, ti_hidden, node_specific, num_nodes).to(device) \
+                         if (use_future_ti and tid_sizes) else None
     def fit(self, 
             train_input, 
             train_target, 
@@ -106,7 +137,24 @@ class BaseModel(nn.Module):
         
         self.load_state_dict(best_weights)
 
-        
+    def _apply_future_ti(self, y, states):
+        # states: [B,H,C], y: [B,N,H] or [B,H,N]
+        if self.future_ti is None or states is None or states.numel() == 0:
+            return y
+        delta = self.future_ti(states)  # [B,H,N] or [B,H,1]
+        if delta is None:
+            return y
+        # Align shapes to [B,H,N] for addition
+        B, Hs, _ = states.shape
+        if y.dim() != 3:
+            return y
+        y_is_BNH = (y.shape[2] == Hs)      # True if [B,N,H]
+        y_hn = y.transpose(1, 2) if y_is_BNH else y  # -> [B,H,N]
+        if delta.size(-1) == 1:
+            delta = delta.expand(-1, -1, y_hn.size(-1))
+        y_hn = y_hn + delta
+        return y_hn.transpose(1, 2) if y_is_BNH else y_hn
+
     def train_epoch(self, optimizer, loss_fn, feature, states=None, graph=None, dynamic_graph=None, target=None, batch_size=1, device='cpu'):
         """
         Trains one epoch with the given data.
@@ -145,6 +193,7 @@ class BaseModel(nn.Module):
             if graph is not None:
                 graph = graph.to(device)
             out = self.forward(X_batch, graph, X_states, batch_graph)
+            out = self._apply_future_ti(out, X_states)
             loss = loss_fn(out, y_batch)
             # import ipdb; ipdb.set_trace()
             loss.backward()
@@ -168,6 +217,7 @@ class BaseModel(nn.Module):
                 states = states.to(device)
 
             out = self.forward(feature, graph, states, dynamic_graph)
+            out = self._apply_future_ti(out, states)
             val_loss = loss_fn(out, target)
             val_loss = val_loss.detach().cpu().item()
             
@@ -194,6 +244,7 @@ class BaseModel(nn.Module):
                 feature = feature.to(self.device)
             # import ipdb; ipdb.set_trace()
             result = self.forward(feature, graph, states, dynamic_graph)
+            result = self._apply_future_ti(result, states)
         return result.detach().cpu()
 
 class BaseTemporalModel(nn.Module):

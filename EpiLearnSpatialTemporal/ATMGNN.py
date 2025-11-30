@@ -102,11 +102,23 @@ class ATMGNN(BaseModel):
                 nhead = 1, 
                 num_clusters = [10, 5], 
                 use_norm = False,
+                device="cpu", 
+                use_future_ti=False, 
+                tid_sizes=None, 
+                emb_dim=4, 
+                ti_hidden=(16,), 
+                node_specific=True, 
                 **kwargs):
         
-        super(ATMGNN, self).__init__()
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.window = num_timesteps_input
         self.nout = num_timesteps_output
         self.n_nodes = num_nodes

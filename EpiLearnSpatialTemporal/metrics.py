@@ -22,8 +22,12 @@ def get_loss(loss_name = 'mse'):
     loss_name = loss_name.lower()
     if loss_name == 'mse':
         return nn.MSELoss()
-    if loss_name == 'mae':
+    elif loss_name == 'mae':
         return nn.L1Loss()
+    elif loss_name == 'mse_filtered':
+        return mse_filtered_loss
+    elif loss_name == 'mae_filtered':
+        return mae_filtered_loss
     elif loss_name == 'stan':
         return stan_loss
     elif loss_name == 'epi_cola':
@@ -31,6 +35,35 @@ def get_loss(loss_name = 'mse'):
     elif loss_name == 'ce':
         return cross_entropy_loss
 
+def mse_filtered_loss(pred, target, iqr_mult=1.5):
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+    if torch.all(target == 0): 
+        return torch.tensor(0., device=target.device)
+
+    mask = torch.isfinite(target) & (target != 0)
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    return torch.mean((pred[mask] - target[mask]) ** 2) if mask.any() else torch.tensor(0., device=target.device)
+
+def mae_filtered_loss(pred, target, iqr_mult=1.5):
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+    if torch.all(target == 0): 
+        return torch.tensor(0., device=target.device)
+
+    mask = torch.isfinite(target) & (target != 0)
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    return torch.mean(torch.abs(pred[mask] - target[mask])) if mask.any() else torch.tensor(0., device=target.device)
 
 def stan_loss(output, label, scale=0.5):
     """
@@ -179,3 +212,100 @@ def get_ACC(pred, target):
     """
     result = pred.eq(target).sum()/len(pred.reshape(-1))
     return result
+
+def get_MSE_filtered(pred, target, iqr_mult=1.5, exclude_zeros=True):
+    """Mean Squared Error after filtering target zeros/outliers."""
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+
+    mask = torch.isfinite(target)
+    if exclude_zeros:
+        mask &= (target != 0)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    err2 = (pred[mask] - target[mask]) ** 2
+    return err2.mean()
+
+def get_RMSE_filtered(pred, target, iqr_mult=1.5, exclude_zeros=True):
+    """Root Mean Squared Error after filtering target zeros/outliers."""
+    mse = get_MSE_filtered(pred, target, iqr_mult, exclude_zeros)
+    return torch.sqrt(mse)
+
+def get_MAE_filtered(pred, target, iqr_mult=1.5, exclude_zeros=True):
+    """Mean Absolute Error after filtering target zeros/outliers."""
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+
+    mask = torch.isfinite(target)
+    if exclude_zeros:
+        mask &= (target != 0)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    err = (pred[mask] - target[mask]).abs()
+    return err.mean()
+
+def get_medAE(pred, target, iqr_mult=1.5, exclude_zeros=True):
+    """Median Absolute Error after filtering target zeros/outliers."""
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+
+    mask = torch.isfinite(target)
+    if exclude_zeros:
+        mask &= (target != 0)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    err = (pred[mask] - target[mask]).abs()
+    return err.median()
+
+def get_medSE(pred, target, iqr_mult=1.5, exclude_zeros=True):
+    """Median Squared Error after filtering target zeros/outliers."""
+    pred = pred.reshape_as(target).float()
+    target = target.float()
+
+    mask = torch.isfinite(target)
+    if exclude_zeros:
+        mask &= (target != 0)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    v = target[mask]
+    q1, q3 = torch.quantile(v, 0.25), torch.quantile(v, 0.75)
+    iqr = q3 - q1
+    lower = q1 - iqr_mult * iqr if iqr != 0 else q1
+    upper = q3 + iqr_mult * iqr if iqr != 0 else q3
+    mask &= (target >= lower) & (target <= upper)
+    if mask.sum() == 0:
+        return torch.tensor(float('nan'), device=target.device)
+
+    err2 = (pred[mask] - target[mask]) ** 2
+    return err2.median()

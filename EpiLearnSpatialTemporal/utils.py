@@ -5,6 +5,91 @@ import torch.nn as nn
 import math
 import torch.fft as fft
 from einops import rearrange, reduce, repeat
+import matplotlib.pyplot as plt
+
+def generate_dataset(
+    X=None, Y=None, states=None, dynamic_adj=None,
+    lookback_window_size=1, horizon_size=1, ahead=0, permute=False
+):
+    T = X.shape[0]
+    win = lookback_window_size + ahead + horizon_size
+    indices = [(i, i + win) for i in range(T - win + 1)]
+
+    # Targets: [N, H, ...]
+    target_slices = []
+    for i, j in indices:
+        target_slices.append(Y[i + lookback_window_size + ahead : j])
+    targets = torch.stack(target_slices) if target_slices else torch.Tensor([[[]]])
+
+    # Past X windows: [N, L, ...]
+    X_slices = []
+    for i, j in indices:
+        X_slices.append(X[i : i + lookback_window_size])
+    X_win = torch.stack(X_slices) if X_slices else torch.Tensor([[[]]])
+
+    S_past, S_future = None, None
+    if states is not None:
+        assert states.dim() == 2, "states must be [T, C]"
+        S_past_slices, S_future_slices = [], []  # NEW
+        for i, j in indices:
+            S_past_slices.append(states[i : i + lookback_window_size])                       # [L, C]
+            S_future_slices.append(states[i + lookback_window_size + ahead : j])            # [H, C]  # NEW
+        S_past = torch.stack(S_past_slices) if S_past_slices else torch.Tensor([[[]]])
+        S_future = torch.stack(S_future_slices) if S_future_slices else torch.Tensor([[[]]])  # NEW
+
+    A_dyn = None
+    if dynamic_adj is not None:
+        A_slices = []
+        for i, j in indices:
+            A_slices.append(dynamic_adj[i : i + lookback_window_size])
+        A_dyn = torch.stack(A_slices) if A_slices else torch.Tensor([[[]]])
+
+    if permute:
+        X_win = X_win.transpose(1, 2)
+        if A_dyn is not None:
+            A_dyn = A_dyn.transpose(1, 2)
+
+    # return both past and future states (future will be used as predictors for y)
+    return X_win, targets, S_past, S_future, A_dyn
+
+@torch.no_grad()
+def get_ti_embeddings(model):
+    """
+    Returns a dict: {channel_name: tensor[K, emb_dim]}
+    """
+    assert model.future_ti is not None, "future_ti not enabled on this model"
+    embs = {}
+    for k, lin in model.future_ti.embs.items():
+        # Linear(K -> emb_dim, bias=False) on one-hot => E = W^T
+        E = lin.weight.T.detach().cpu()   # [K, emb_dim]
+        embs[k] = E
+    return embs
+
+def to_2d(X, method="pca", random_state=0):
+    if method == "pca":
+        from sklearn.decomposition import PCA
+        return PCA(n_components=2).fit_transform(X)
+    elif method == "tsne":
+        # keep perplexity sane for small class counts
+        perplexity = max(5, min(30, (X.shape[0]-1)//3 or 5))
+        from sklearn.manifold import TSNE
+        return TSNE(n_components=2, random_state=random_state, init="random",
+                    perplexity=perplexity).fit_transform(X)
+    elif method == "umap":
+        import umap
+        return umap.UMAP(n_components=2, random_state=random_state).fit_transform(X)
+    else:
+        raise ValueError("method must be 'pca', 'tsne', or 'umap'")
+
+def plot_2d(Z, labels=None, title=""):
+    fig, ax = plt.subplots()
+    ax.scatter(Z[:,0], Z[:,1])          # no explicit colors; defaults are fine
+    if labels is not None:
+        for i, txt in enumerate(labels):
+            ax.annotate(str(txt), (Z[i,0], Z[i,1]), fontsize=9)
+    ax.set_title(title)
+    ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
+    plt.show()
 
 def accuracy(output, labels):
     """Return accuracy of output compared to labels.

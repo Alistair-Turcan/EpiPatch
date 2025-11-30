@@ -92,10 +92,17 @@ class GraphWaveNet(BaseModel):
         Each slice along the second dimension corresponds to a timestep, with each column representing a node.
     """
     def __init__(self, device="cpu", dropout=0.3, gcn_bool=True, addaptadj=True, aptinit=None, num_timesteps_input=2,num_timesteps_output=12,
-                 residual_channels=32,dilation_channels=32,skip_channels=256,end_channels=512,kernel_size=2,blocks=4,nlayers=2, adj_m=None, num_nodes = None, **kwargs):
-        super(GraphWaveNet, self).__init__(device=device)
+                 residual_channels=32,dilation_channels=32,skip_channels=256,end_channels=512,kernel_size=2,blocks=4,nlayers=2, adj_m=None, num_nodes = None, 
+                 use_future_ti=False, tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs):
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.device = device
         self.dropout = dropout
         self.blocks = blocks

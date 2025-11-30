@@ -1019,10 +1019,16 @@ class MultiViewFusion(nn.Module):
         return fusion_output, attn_weights
 
 class EARTH(BaseModel):
-    def __init__(self, num_timesteps_input, num_timesteps_output, dtw_matrix, adj_m=None, num_nodes=None, num_features=1, dropout=0.2, n_hidden=20, device="cpu", **kwargs): 
-        super(EARTH, self).__init__()
+    def __init__(self, num_timesteps_input, num_timesteps_output, dtw_matrix, adj_m=None, num_nodes=None, num_features=1, dropout=0.2, n_hidden=16, device="cpu", use_future_ti=False, tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs): 
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.x_h = num_features # 1
         self.m = num_nodes
         self.w = num_timesteps_input
@@ -1059,7 +1065,7 @@ class EARTH(BaseModel):
         
         self.d_model = n_hidden
         
-        self.d_state = 32
+        self.d_state = 16
         
         self.Wb = Parameter(torch.Tensor(self.m,self.m))
         self.wb = Parameter(torch.Tensor(1))
@@ -1080,7 +1086,7 @@ class EARTH(BaseModel):
                                         num_hidden_layers=1)
         self.vector_field_g = VectorField_g(input_channels=self.input_dim , hidden_channels=n_hidden,
                                         hidden_hidden_channels=n_hidden,
-                                        num_hidden_layers=2, num_nodes=self.m, cheb_k=3, embed_dim=64,
+                                        num_hidden_layers=2, num_nodes=self.m, cheb_k=3, embed_dim=n_hidden,
                                         g_type="agc", adj = self.o_adj)
         
         self.vector_field_g.orig_adj = self.o_adj

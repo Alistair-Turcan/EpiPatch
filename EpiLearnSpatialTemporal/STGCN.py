@@ -153,7 +153,8 @@ class STGCN(BaseModel):
 
     def __init__(self, num_timesteps_input, num_timesteps_output,
                  adj_m = None, num_nodes = None, num_features = 1,
-                 nhids = 128, device='cpu', **kwargs):
+                 nhids = 128, device='cpu', use_future_ti=False,
+                 tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs):
         """
         :param num_nodes: Number of nodes in the graph.
         :param num_features: Number of features at each node in each time step.
@@ -164,9 +165,15 @@ class STGCN(BaseModel):
         """
         self.nhid = nhids
         self.spatial_nhid = nhids
-        super(STGCN, self).__init__(device=device)
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.block1 = STGCNBlock(in_channels=num_features, out_channels=self.nhid,
                                  spatial_channels=self.spatial_nhid, num_nodes=num_nodes).to(self.device)
         self.block2 = STGCNBlock(in_channels=self.nhid, out_channels=self.nhid,

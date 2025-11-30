@@ -63,10 +63,16 @@ class STNorm(BaseModel):
     Task: Spatial-Temporal Forecasting
     """
 
-    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m = None, num_nodes = None, num_features = 1, tnorm_bool = True, snorm_bool = True, channels = 32, kernel_size = 2, blocks = 4, layers = 2, device="cpu", **kwargs):
-        super(STNorm, self).__init__(device=device)
+    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m = None, num_nodes = None, num_features = 1, tnorm_bool = True, snorm_bool = True, channels = 32, kernel_size = 2, blocks = 4, layers = 2, device="cpu", use_future_ti=False, tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs):
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         in_dim = num_features
         self.blocks = blocks
         self.layers = layers

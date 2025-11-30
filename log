@@ -1,6 +1,5 @@
 # BasicTS Recommended: Python 3.11 + PyTorch 2.5.1 + CUDA 12.4
+# https://github.com/GestaltCogTeam/BasicTS/tree/c218c07b6ce5e4cf908b147fd180c486346fed9c
 conda create -n benchmark python=3.11
 conda activate benchmark
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-
-/net/dali/home/mscbio/rul98/MultiTrendDetection/GeoPred/EpiLearn

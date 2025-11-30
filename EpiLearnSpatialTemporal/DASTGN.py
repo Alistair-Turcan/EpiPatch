@@ -333,10 +333,21 @@ class DASTGN(BaseModel):
                 GNN_layers = 2,
                 nhids = None,
                 device = 'cpu',
+                use_future_ti=False, 
+                tid_sizes=None, 
+                emb_dim=4, 
+                ti_hidden=(16,), 
+                node_specific=True, 
                 **kwargs):
-        super(DASTGN, self).__init__(device=device)
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.device = device
         self.num_timestamps = num_timesteps_input
         self.input_size = num_features

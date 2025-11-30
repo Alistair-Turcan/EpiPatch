@@ -322,13 +322,24 @@ class GTS(BaseModel, Seq2SeqAttrs):
         temp=0.5,
         k=5,
         device="cpu",
+        use_future_ti=False, 
+        tid_sizes=None, 
+        emb_dim=4, 
+        ti_hidden=(16,), 
+        node_specific=True, 
         **kwargs
     ):
         if num_nodes is None and adj_m is not None:
             num_nodes = adj_m.shape[0]
         seq_len = num_timesteps_input
         horizon = num_timesteps_output
-        super(GTS, self).__init__(device=device)
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         Seq2SeqAttrs.__init__(
             self,
             rnn_units=rnn_units,

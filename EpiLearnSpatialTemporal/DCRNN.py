@@ -384,9 +384,22 @@ class DCRNN(BaseModel, Seq2SeqAttrs):
               nonlinearity="tanh",
               dropout=0,
               device="cpu",
+              use_future_ti=False,
+              tid_sizes=None,
+              emb_dim=4,
+              ti_hidden=(16,),
+              node_specific=True,
               **kwargs):
 
-        super().__init__()
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         Seq2SeqAttrs.__init__(self, max_diffusion_step=max_diffusion_step, filter_type=filter_type,
                               num_rnn_layers=num_rnn_layers, rnn_units=rnn_units)
         

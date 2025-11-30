@@ -343,8 +343,16 @@ class MTGNN(BaseModel):
     Task: Spatial-Temporal Forecasting
     """
 
-    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m=None, num_nodes=None, num_features=1, gcn_true=True, buildA_true=True, gcn_depth=2, static_feat=None, dropout=0.3, subgraph_size=20, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True, device="cpu", **kwargs):
-        super(MTGNN, self).__init__(device=device)
+    def __init__(self, num_timesteps_input, num_timesteps_output, adj_m=None, num_nodes=None, num_features=1, gcn_true=True, buildA_true=True, gcn_depth=2, static_feat=None, dropout=0.3, subgraph_size=20, node_dim=40, dilation_exponential=1, conv_channels=32, residual_channels=32, skip_channels=64, end_channels=128, layers=3, propalpha=0.05, tanhalpha=3, layer_norm_affline=True, device="cpu", use_future_ti=False, tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs):
+        if num_nodes is None and adj_m is not None:
+            num_nodes = adj_m.shape[0]
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         seq_length = num_timesteps_input
         out_dim = num_timesteps_output
         if num_nodes is None and adj_m is not None:
