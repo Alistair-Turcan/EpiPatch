@@ -65,8 +65,16 @@ class DlinearModel(BaseModel):
         Each element corresponds to a predicted value for a specific future timestep. The output is averaged across the feature dimension to reduce it to a single predictive value per timestep.
 
     """
-    def __init__(self, num_features, num_timesteps_input, num_timesteps_output, device='cpu'):
-        super(DlinearModel, self).__init__(device=device)
+    def __init__(self, num_timesteps_input, num_timesteps_output, num_features=1,
+                 num_nodes = None, device='cpu', use_future_ti=False,
+                 tid_sizes=None, emb_dim=4, ti_hidden=(16,), node_specific=True, **kwargs):
+        super().__init__(tid_sizes=tid_sizes,
+                         device=device,
+                         use_future_ti=use_future_ti,
+                         emb_dim=emb_dim,
+                         ti_hidden=ti_hidden,
+                         node_specific=node_specific,
+                         num_nodes=num_nodes)
         self.num_features = num_features
         self.num_timesteps_input = num_timesteps_input
         self.num_timesteps_output = num_timesteps_output
@@ -111,7 +119,8 @@ class DlinearModel(BaseModel):
             node_outputs.append(out_n)
         output = torch.stack(node_outputs, dim=1)
         output = output.permute(0, 2, 1, 3)
-        output = output.squeeze(-1)
+        if self.num_features == 1:
+            output = output.squeeze(-1)
         return output
 
     def reset_parameters(self):
