@@ -35,6 +35,45 @@ def get_loss(loss_name = 'mse'):
     elif loss_name == 'ce':
         return cross_entropy_loss
 
+def crps_ensemble(samples, target):
+    """
+    samples: (S, ...) ensemble / bootstrap forecasts
+    target:  (...)   observations
+    returns scalar CRPS
+    """
+    S = samples.shape[0]
+    samples = samples.reshape(S, -1)        # (S, M)
+    target  = target.reshape(1, -1)        # (1, M)
+    term1 = (samples - target).abs().mean(dim=0)  # E|X - y|
+    diff  = samples.unsqueeze(0) - samples.unsqueeze(1)  # (S, S, M)
+    term2 = diff.abs().mean(dim=(0, 1))              # E|X - X'|
+    crps = term1 - 0.5 * term2                      # (M,)
+    return crps.mean()
+
+def wis_from_quantiles(q, target, alphas):
+    """
+    q: (1 + 2K, ...) quantiles in order:
+       [0.5, 0.5-0.5*alpha1, 0.5+0.5*alpha1, 0.5-0.5*alpha2, 0.5+0.5*alpha2, ...]
+    target: (...) observations
+    alphas: (alpha1, alpha2, ..., alphaK)
+    returns scalar WIS
+    """
+    y = target
+    median = q[0]
+    ae = (median - y).abs()
+    wis_num = 0.5 * ae
+    for k, alpha in enumerate(alphas):
+        l = q[1 + 2*k]
+        u = q[2 + 2*k]
+        width = u - l
+        below = (y < l).float()
+        above = (y > u).float()
+        iscore = width + (2.0/alpha) * (l - y) * below + (2.0/alpha) * (y - u) * above
+        wis_num = wis_num + 0.5 * alpha * iscore
+    denom = 0.5 + 0.5 * sum(alphas)
+    wis = wis_num / denom
+    return wis.mean()
+
 def mse_filtered_loss(pred, target, iqr_mult=1.5):
     pred = pred.reshape_as(target).float()
     target = target.float()
