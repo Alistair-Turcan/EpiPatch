@@ -8,7 +8,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from .utils import *
-from .metrics import get_loss
+from .metrics import crps_ensemble, get_loss, wis_from_quantiles
 
 US_POP_2019 = {
     "AL": 4903185, "AK": 731545,  "AZ": 7278717, "AR": 3017804, "CA": 39512223,
@@ -808,6 +808,82 @@ class BaseModel(nn.Module):
         q_tensor = torch.tensor(quantiles, device=self.device, dtype=samples.dtype)
         q = torch.quantile(samples, q=q_tensor, dim=0)
         return q.detach().cpu()
+
+    def compute_crps_wis(
+        self,
+        feature,
+        target,
+        quantile_levels,
+        alphas,
+        graph=None,
+        states=None,
+        dynamic_graph=None,
+        n_samples=100,
+    ):
+        """
+        Compute CRPS and WIS for both unfiltered and filtered residual-bootstrap predictions.
+
+        Notes:
+            - Assumes _fit_conformal(...) has been called to populate residual banks.
+            - If filtered residuals are unavailable, filtered metrics fall back to unfiltered.
+
+        Returns:
+            dict with keys: crps, crps_filtered, wis, wis_filtered (torch scalars).
+        """
+        target = target.to(self.device)
+
+        samples = self.predict_samples(
+            feature,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=False,
+        )
+        samples = samples.reshape(samples.shape[0], *target.shape)
+        crps = crps_ensemble(samples, target)
+
+        samples_filtered = self.predict_samples(
+            feature,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=True,
+        )
+        samples_filtered = samples_filtered.reshape(samples_filtered.shape[0], *target.shape)
+        crps_filtered = crps_ensemble(samples_filtered, target)
+
+        q = self.predict_quantiles(
+            feature,
+            quantile_levels,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=False,
+        )
+        q = q.reshape(q.shape[0], *target.shape)
+        wis = wis_from_quantiles(q, target, alphas=alphas)
+
+        q_filtered = self.predict_quantiles(
+            feature,
+            quantile_levels,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=True,
+        )
+        q_filtered = q_filtered.reshape(q_filtered.shape[0], *target.shape)
+        wis_filtered = wis_from_quantiles(q_filtered, target, alphas=alphas)
+
+        return {
+            "crps": crps,
+            "crps_filtered": crps_filtered,
+            "wis": wis,
+            "wis_filtered": wis_filtered,
+        }
 
     def fit(self, 
             train_input, 
