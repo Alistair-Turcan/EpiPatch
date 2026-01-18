@@ -593,27 +593,196 @@ class BaseModel(nn.Module):
         self.future_ti = _FutureTI(tid_sizes, emb_dim, ti_hidden, node_specific, num_nodes).to(device) \
                          if (use_future_ti and tid_sizes) else None
 
-    def predict_samples(self, feature, graph=None, states=None, dynamic_graph=None, n_samples=100, filtered = False):
+    @staticmethod
+    def _conformal_qhat_abs(abs_resid, alpha):
         """
-        Default: additive Gaussian noise with std estimated from training residuals.
-        Returns: (S, ...) where ... is predict() shape.
+        abs_resid: (N_calib, ...) nonnegative absolute residuals
+        Returns qhat(...) with the split-conformal finite-sample correction:
+            k = ceil((N+1)*(1-alpha)) - 1  (0-indexed)
+            qhat = k-th order statistic along calibration dimension.
+        This corresponds to the 'higher' quantile needed for coverage.
+        """
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f"alpha must be in (0,1), got {alpha}")
+        N = abs_resid.shape[0]
+        # k in {0,...,N-1}
+        k = int(math.ceil((N + 1) * (1.0 - alpha))) - 1
+        k = max(0, min(N - 1, k))
+        # sort along calibration dimension
+        sorted_vals, _ = torch.sort(abs_resid, dim=0)
+        return sorted_vals[k]
+
+    @staticmethod
+    def _filter_samples_by_iqr(sample_scores, iqr_mult=1.5):
+        """
+        sample_scores: (N,) robust score per calibration sample (bigger = more outlier-ish)
+        returns boolean mask of shape (N,) for samples within IQR fence.
+        """
+        q1 = torch.quantile(sample_scores, 0.25)
+        q3 = torch.quantile(sample_scores, 0.75)
+        iqr = q3 - q1
+        if iqr == 0:
+            lower, upper = q1, q3
+        else:
+            lower = q1 - iqr_mult * iqr
+            upper = q3 + iqr_mult * iqr
+        return (sample_scores >= lower) & (sample_scores <= upper)
+
+    def _fit_conformal(
+        self,
+        feature,
+        target,
+        states=None,
+        graph=None,
+        dynamic_graph=None,
+        exclude_zeros=True,
+        iqr_mult=1.5,
+    ):
+        """
+        Calibrate conformal residuals on a held-out calibration set.
+
+        Stores:
+            self._calib_resid          (N, ...)  residuals: (y - pred)
+            self._calib_abs_resid      (N, ...)  abs residuals: |y - pred|
+            self._calib_resid_filtered
+            self._calib_abs_resid_filtered
+
+        Filtering is done on a robust *residual-based* sample score (not target magnitude):
+            score_i = mean_j |r_{ij}| over valid elements j
+        """
+        self.eval()
+        with torch.no_grad():
+            pred = self.predict(
+                feature=feature,
+                graph=graph,
+                states=states,
+                dynamic_graph=dynamic_graph,
+            ).to(self.device)
+            y = target.to(self.device)
+            pred = pred.reshape_as(y)
+            # residuals: y - pred (note sign; abs-residual is sign-invariant)
+            resid = (y - pred)
+            # valid elements mask
+            mask_elem = torch.isfinite(y)
+            if exclude_zeros:
+                mask_elem &= (y != 0)
+            # If nothing valid, just use everything
+            if mask_elem.sum() == 0:
+                resid_valid = resid
+                mask_elem = torch.ones_like(y, dtype=torch.bool, device=y.device)
+            else:
+                # Keep resid but ignore invalid elements for scoring/filtering
+                resid_valid = resid.clone()
+                resid_valid[~mask_elem] = 0.0
+            abs_resid = resid_valid.abs()
+            # store unfiltered (still respecting invalid element handling)
+            self._calib_resid = resid_valid.detach()
+            self._calib_abs_resid = abs_resid.detach()
+            # ---- filtered version: remove calibration samples with unusually large residual score
+            # score per sample = mean abs residual over valid elements
+            # shape: (N,)
+            N = resid_valid.shape[0]
+            flat_abs = abs_resid.view(N, -1)
+            flat_mask = mask_elem.view(N, -1)
+            denom = flat_mask.sum(dim=1).clamp(min=1)
+            sample_score = (flat_abs.sum(dim=1) / denom)  # mean |resid| per sample
+            keep = self._filter_samples_by_iqr(sample_score, iqr_mult=iqr_mult)
+            if keep.sum() == 0:
+                # fallback: no filtering
+                self._calib_resid_filtered = self._calib_resid
+                self._calib_abs_resid_filtered = self._calib_abs_resid
+            else:
+                self._calib_resid_filtered = resid_valid[keep].detach()
+                self._calib_abs_resid_filtered = abs_resid[keep].detach()
+
+    def predict_conformal_intervals(
+        self,
+        feature,
+        alphas,
+        graph=None,
+        states=None,
+        dynamic_graph=None,
+        filtered=False,
+    ):
+        """
+        Returns dict alpha -> (lower, upper) tensors matching predict() shape.
+        Uses split conformal: [pred - qhat_alpha, pred + qhat_alpha].
+        Requires: _fit_conformal called beforehand.
         """
         base = self.predict(feature, graph=graph, states=states, dynamic_graph=dynamic_graph).to(self.device)
-        if filtered == True:
-            noise_std = self._noise_std_filtered
+        abs_resid = self._calib_abs_resid_filtered if filtered else self._calib_abs_resid
+        if abs_resid is None:
+            raise RuntimeError("Conformal not fitted. Call _fit_conformal(...) on a calibration set first.")
+        out = {}
+        for alpha in alphas:
+            qhat = self._conformal_qhat_abs(abs_resid.to(self.device), float(alpha))
+            # broadcast qhat to base.shape if needed (qhat should already be (...))
+            while qhat.dim() < base.dim():
+                qhat = qhat.unsqueeze(0)
+            lower = base - qhat
+            upper = base + qhat
+            out[float(alpha)] = (lower.detach().cpu(), upper.detach().cpu())
+        return out
+
+    def predict_quantiles_conformal_for_wis(
+        self,
+        feature,
+        alphas,
+        graph=None,
+        states=None,
+        dynamic_graph=None,
+        filtered=False,
+    ):
+        """
+        Returns q tensor shaped (1 + 2K, ...) in the same layout your wis_from_quantiles expects:
+            q[0] = median (here: base point forecast)
+            q[1+2k] = lower for alpha_k
+            q[2+2k] = upper for alpha_k
+        Note: This produces *central* conformal intervals around the point forecast.
+        """
+        base = self.predict(feature, graph=graph, states=states, dynamic_graph=dynamic_graph).to(self.device)
+        abs_resid = self._calib_abs_resid_filtered if filtered else self._calib_abs_resid
+        if abs_resid is None:
+            raise RuntimeError("Conformal not fitted. Call _fit_conformal(...) on a calibration set first.")
+        alphas = [float(a) for a in alphas]
+        q_list = [base]  # treat point forecast as "median" for WIS layout
+        for alpha in alphas:
+            qhat = self._conformal_qhat_abs(abs_resid.to(self.device), alpha)
+            while qhat.dim() < base.dim():
+                qhat = qhat.unsqueeze(0)
+            q_list.append(base - qhat)  # "lower"
+            q_list.append(base + qhat)  # "upper"
+        q = torch.stack(q_list, dim=0)
+        return q.detach().cpu()
+
+    def predict_samples(self, feature, graph=None, states=None, dynamic_graph=None, n_samples=100, filtered=False):
+        """
+        Residual-bootstrap samples (for CRPS-like ensemble metrics, no strict coverage guarantee):
+            sample = base + r*, where r* is a residual drawn from the calibration residuals.
+        For distribution-free coverage, use predict_conformal_intervals / predict_quantiles_conformal_for_wis instead.
+        """
+        base = self.predict(feature, graph=graph, states=states, dynamic_graph=dynamic_graph).to(self.device)
+        resid_bank = self._calib_resid_filtered if filtered else self._calib_resid
+        if resid_bank is None:
+            # fallback: identical copies
+            return base.unsqueeze(0).detach().cpu()
+        resid_bank = resid_bank.to(self.device)
+        N = resid_bank.shape[0]
+        # Assume base is (B, ...) with B=batch size. If no batch dim, treat B=1.
+        if base.dim() == resid_bank.dim() - 1:
+            # base is missing leading sample dimension, add batch dim = 1
+            base_b = base.unsqueeze(0)
         else:
-            noise_std = self._noise_std
-        if noise_std is None:
-            # no estimate available -> tiny noise instead of identical copies
-            eps_scale = 1e-3 * (base.std() + 1.0)
-            noise = torch.randn((n_samples,) + tuple(base.shape), device=self.device) * eps_scale
-            return base.unsqueeze(0) + noise
-        noise_std = noise_std.to(self.device)
-        # broadcast noise_std to base.shape
-        while noise_std.dim() < base.dim():
-            noise_std = noise_std.unsqueeze(0)  # match leading batch dim
-        noise = torch.randn((n_samples,) + tuple(base.shape), device=self.device) * noise_std.unsqueeze(0)
-        return base.unsqueeze(0) + noise
+            base_b = base
+        B = base_b.shape[0]
+        # draw residual indices for each (sample, batch)
+        idx = torch.randint(0, N, size=(n_samples, B), device=self.device)
+        sampled_resid = resid_bank[idx]  # (S, B, ...)
+        samples = base_b.unsqueeze(0) + sampled_resid  # (S, B, ...)
+        # if we added a fake batch dim, remove it
+        if base.dim() == resid_bank.dim() - 1:
+            samples = samples[:, 0, ...]  # (S, ...)
+        return samples.detach().cpu()
 
     def predict_quantiles(
         self,
@@ -623,14 +792,22 @@ class BaseModel(nn.Module):
         states=None,
         dynamic_graph=None,
         n_samples=100,
-        filtered = False
+        filtered=False,
     ):
+        """
+        Quantiles from residual-bootstrap samples.
+        Produces quantiles of a sampled ensemble, not conformal intervals.
+        It gives you an approximate predictive distribution (empirical), but no finite-sample coverage guarantee.
+        If what you need is WIS-style central intervals with guarantees, prefer:
+            predict_quantiles_conformal_for_wis(feature, alphas, ...)
+        """
         samples = self.predict_samples(
-            feature, graph=graph, states=states, dynamic_graph=dynamic_graph, n_samples=n_samples, filtered = filtered
+            feature, graph=graph, states=states, dynamic_graph=dynamic_graph,
+            n_samples=n_samples, filtered=filtered
         ).to(self.device)
         q_tensor = torch.tensor(quantiles, device=self.device, dtype=samples.dtype)
         q = torch.quantile(samples, q=q_tensor, dim=0)
-        return q.cpu()
+        return q.detach().cpu()
 
     def fit(self, 
             train_input, 
@@ -739,46 +916,6 @@ class BaseModel(nn.Module):
         plt.show()
         
         self.load_state_dict(best_weights)
-        self._estimate_noise_std(train_input, train_target, train_states, train_graph, train_dynamic_graph)
-
-    def _estimate_noise_std(self, feature, target, states=None, graph=None, dynamic_graph=None, iqr_mult=1.5, exclude_zeros=True):
-        self.eval()
-        with torch.no_grad():
-            pred = self.predict(feature=feature,
-                                graph=graph,
-                                states=states,
-                                dynamic_graph=dynamic_graph).to(self.device)
-            target = target.to(self.device)
-            pred = pred.reshape_as(target)
-            diff = pred - target
-            # if not filtered:
-            self._noise_std = diff.std(dim=0, unbiased=True)
-            if torch.all(self._noise_std == 0):
-                self._noise_std = diff.std() * torch.ones_like(self._noise_std)
-            # if filtered:
-            mask_elem = torch.isfinite(target)
-            if exclude_zeros:
-                mask_elem &= (target != 0)
-            if mask_elem.sum() == 0:
-                resid = diff
-            else:
-                v = target[mask_elem]
-                q1, q3 = torch.quantile(v, torch.tensor([0.25, 0.75], device=target.device))
-                iqr = q3 - q1
-                if iqr == 0:
-                    lower, upper = q1, q3
-                else:
-                    lower = q1 - iqr_mult * iqr
-                    upper = q3 + iqr_mult * iqr
-                mask_elem &= (target >= lower) & (target <= upper)
-                mask_sample = mask_elem.view(mask_elem.shape[0], -1).all(dim=1)
-                if mask_sample.sum() == 0:
-                    resid = diff
-                else:
-                    resid = diff[mask_sample]
-            self._noise_std_filtered = resid.std(dim=0, unbiased=True)
-            if torch.all(self._noise_std_filtered == 0):
-                self._noise_std_filtered = resid.std() * torch.ones_like(self._noise_std_filtered)
 
     def _apply_future_ti(self, y, states):
         # states: [B,H,C], y: [B,N,H] or [B,H,N]
