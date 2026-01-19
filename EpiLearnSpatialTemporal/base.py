@@ -8,7 +8,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from .utils import *
-from .metrics import get_loss
+from .metrics import crps_ensemble, get_loss, wis_from_quantiles
 
 US_POP_2019 = {
     "AL": 4903185, "AK": 731545,  "AZ": 7278717, "AR": 3017804, "CA": 39512223,
@@ -316,6 +316,316 @@ def compute_epi_ngm_forecast(
     x = x_last.to(device=device, dtype=dtype).view(B, 1, 1, M).expand(B, H, 1, M)
     y_epi = torch.matmul(x, ngm.transpose(-1, -2)).squeeze(-2)  # [B,H,M]
     return y_epi
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden=(64, 64), out_dim=1, act=nn.Tanh, dropout=0.0):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for h in hidden:
+            layers.append(nn.Linear(d, h))
+            layers.append(act())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            d = h
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+def build_adj_prob(dynamic_graph, graph, B, H, M, device, dtype):
+    """
+    Returns adj_prob [B,H,M,M] (softmax along last dim).
+    Prefers dynamic_graph if provided; otherwise uses static graph.
+    """
+    if dynamic_graph is not None:
+        dg = dynamic_graph.to(device=device, dtype=dtype)
+        if dg.dim() == 4:
+            adj_prob = F.softmax(dg, dim=-1)
+            if adj_prob.shape[1] == 1 and H > 1:
+                adj_prob = adj_prob.expand(B, H, M, M)
+            elif adj_prob.shape[1] != H:
+                if adj_prob.shape[1] > H:
+                    adj_prob = adj_prob[:, :H]
+                else:
+                    last = adj_prob[:, -1:].expand(B, H - adj_prob.shape[1], M, M)
+                    adj_prob = torch.cat([adj_prob, last], dim=1)
+            return adj_prob
+        if dg.dim() == 3:
+            return F.softmax(dg, dim=-1).view(B, 1, M, M).expand(B, H, M, M)
+
+    if graph is None:
+        raise ValueError("Need dynamic_graph or graph to build adj_prob.")
+
+    g = graph.to(device=device, dtype=dtype)
+    if g.dim() == 2:
+        return F.softmax(g, dim=-1).view(1, 1, M, M).expand(B, H, M, M)
+    if g.dim() == 3:
+        return F.softmax(g, dim=-1).view(B, 1, M, M).expand(B, H, M, M)
+
+    raise ValueError("graph must be [M,M] or [B,M,M]")
+
+class EinnModule(nn.Module):
+    """
+    Supports epi_mode in {"sir_incidence", "sir_percent", "ngm"}.
+
+    Targets:
+      - raw daily cases: use epi_mode="sir_incidence"
+      - per-capita (percent/per-100k): use epi_mode="sir_percent" and set percent_scale accordingly
+      - ILI proxy: use epi_mode="sir_percent" with outpatient_ratio (optional) and percent_scale to match target
+    """
+    def __init__(
+        self,
+        num_nodes: int,
+        horizon: int,
+        in_features: int,
+        epi_mode: str = "sir_incidence",     # "sir_incidence" | "sir_percent" | "ngm"
+        dt: float = 1.0,
+        target_idx: int = 0,
+        population=None,
+        regions=None,
+        percent_scale: float = 100.0,        # 100 for %, 1e5 for per-100k, 1 for fraction
+        outpatient_ratio: float = None,      # for ILI-like scaling if you want incidence/(N*OR)
+        use_context: bool = True,
+        context_hidden: int = 32,
+        node_emb_dim: int = 8,
+        state_hidden=(64, 64),
+        param_hidden=(64, 64),
+        ode_weight: float = 1.0,
+        data_weight: float = 1.0,
+        constraint_weight: float = 0.0,      # optional small penalty
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.M = int(num_nodes)
+        self.H = int(horizon)
+        self.F = int(in_features)
+        self.epi_mode = str(epi_mode)
+        self.dt = float(dt)
+        self.target_idx = int(target_idx)
+        self.population_spec = population
+        self.regions_spec = regions
+        self.percent_scale = float(percent_scale)
+        self.outpatient_ratio = outpatient_ratio
+        self.use_context = bool(use_context)
+        self.ode_weight = float(ode_weight)
+        self.data_weight = float(data_weight)
+        self.constraint_weight = float(constraint_weight)
+        self.eps = float(eps)
+
+        self.node_emb = nn.Embedding(self.M, node_emb_dim)
+
+        if self.use_context:
+            self.ctx_gru = nn.GRU(self.F, context_hidden, batch_first=True)
+            ctx_dim = context_hidden
+        else:
+            ctx_dim = 0
+
+        # state net: outputs logits for (S,I,R) fractions -> softmax -> *N
+        state_in = 1 + node_emb_dim + ctx_dim
+        self.state_net = MLP(state_in, hidden=state_hidden, out_dim=3, act=nn.Tanh)
+
+        # param net: outputs raw -> sigmoid -> (beta,gamma) in (0,1)
+        param_in = 1 + node_emb_dim + ctx_dim
+        self.param_net = MLP(param_in, hidden=param_hidden, out_dim=2, act=nn.Tanh)
+
+    def _expand_N(self, B, device, dtype):
+        N_m = resolve_population_2019(
+            M=self.M,
+            population=self.population_spec,
+            regions=self.regions_spec,
+            device=device,
+            dtype=dtype,
+        )  # [M]
+        return N_m.view(1, self.M).expand(B, self.M)  # [B,M]
+
+    def _encode_context(self, x):
+        # x: [B,W,M,F]
+        if not self.use_context:
+            return None
+        B, W, M, Fdim = x.shape
+        x_flat = x.transpose(2, 1).contiguous().flatten(0, 1)  # [B*M, W, F]
+        out, _ = self.ctx_gru(x_flat)
+        ctx = out[:, -1, :]                                    # [B*M, C]
+        return ctx.view(B, M, -1)                              # [B,M,C]
+
+    def _time_grid(self, B, device, dtype):
+        # discrete collocation points aligned with horizon
+        t = (torch.arange(self.H, device=device, dtype=dtype) * self.dt)
+        t = t.view(1, self.H, 1, 1).expand(B, self.H, self.M, 1).clone()
+        t.requires_grad_(True)
+        return t  # [B,H,M,1], requires_grad
+
+    def _node_features(self, B, device, dtype):
+        node_ids = torch.arange(self.M, device=device, dtype=torch.long)
+        emb = self.node_emb(node_ids).to(dtype=dtype)     # [M,E]
+        emb = emb.view(1, 1, self.M, -1).expand(B, self.H, self.M, -1)  # [B,H,M,E]
+        return emb
+
+    def _pack_inputs(self, t, node_emb, ctx):
+        # t: [B,H,M,1], node_emb: [B,H,M,E], ctx: [B,M,C] -> broadcast to [B,H,M,C]
+        if ctx is None:
+            return torch.cat([t, node_emb], dim=-1)
+        ctx_h = ctx.view(ctx.shape[0], 1, ctx.shape[1], ctx.shape[2]).expand(-1, self.H, -1, -1)
+        return torch.cat([t, node_emb, ctx_h], dim=-1)
+
+    def _states_and_params(self, x):
+        """
+        Returns:
+          S,I,R: [B,H,M]
+          beta,gamma: [B,H,M]
+          t: [B,H,M,1] (requires_grad)
+          N_bm: [B,M]
+        """
+        B, W, M, Fdim = x.shape
+        device, dtype = x.device, x.dtype
+        N_bm = self._expand_N(B, device, dtype)
+
+        ctx = self._encode_context(x)  # [B,M,C] or None
+        t = self._time_grid(B, device, dtype)
+        emb = self._node_features(B, device, dtype)
+        inp = self._pack_inputs(t, emb, ctx)              # [B,H,M,D]
+
+        flat = inp.view(B * self.H * self.M, -1)
+        state_logits = self.state_net(flat).view(B, self.H, self.M, 3)
+        state_frac = F.softmax(state_logits, dim=-1)      # fractions sum to 1
+
+        N_hm = N_bm.view(B, 1, self.M, 1).expand(B, self.H, self.M, 1)
+        SIR = state_frac * N_hm                           # counts
+        S = SIR[..., 0]
+        I = SIR[..., 1]
+        R = SIR[..., 2]
+
+        param_raw = self.param_net(flat).view(B, self.H, self.M, 2)
+        params = torch.sigmoid(param_raw)                 # (0,1)
+        beta = params[..., 0]
+        gamma = params[..., 1]
+
+        return S, I, R, beta, gamma, t, N_bm
+
+    def _mix_I(self, adj_prob, I):
+        # adj_prob: [B,H,M,M], I: [B,H,M] -> I_mix: [B,H,M]
+        B, H, M, _ = adj_prob.shape
+        Ih = I.view(B * H, M, 1)
+        Ah = adj_prob.view(B * H, M, M)
+        I_mix = torch.bmm(Ah, Ih).view(B, H, M)
+        return I_mix
+
+    def _sir_rhs(self, S, I, R, beta, gamma, I_mix, N_bm):
+        # All inputs [B,H,M] except N_bm [B,M]
+        N = N_bm.unsqueeze(1)  # [B,1,M]
+        inf = beta * S * I_mix / (N + self.eps)          # per unit time
+        dS = -inf
+        dI = inf - gamma * I
+        dR = gamma * I
+        return dS, dI, dR, inf
+
+    def _d_dt(self, y, t):
+        # y: [B,H,M], t: [B,H,M,1] -> dy/dt: [B,H,M]
+        grad = torch.autograd.grad(
+            outputs=y,
+            inputs=t,
+            grad_outputs=torch.ones_like(y),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        return grad.squeeze(-1)
+
+    def _obs_from_incidence(self, inc, N_bm):
+        # inc is per unit time infection flow (not multiplied by dt), shape [B,H,M]
+        cases = self.dt * inc
+        if self.epi_mode == "sir_incidence":
+            y = cases
+        elif self.epi_mode == "sir_percent":
+            denom = N_bm.unsqueeze(1) + self.eps
+            y = (cases / denom) * self.percent_scale
+            if self.outpatient_ratio is not None:
+                y = y / (float(self.outpatient_ratio) + self.eps)
+        else:
+            raise ValueError(f"_obs_from_incidence called with epi_mode={self.epi_mode}")
+        return y
+
+    def forward(self, x, graph=None, dynamic_graph=None):
+        """
+        Returns:
+          y_einn: [B,H,M]
+          losses: dict {"ode":..., "data":..., "constraint":..., "total":...}
+        """
+        B, W, M, Fdim = x.shape
+        device, dtype = x.device, x.dtype
+        assert M == self.M, "num_nodes mismatch"
+        assert self.H > 0, "invalid horizon"
+
+        if self.epi_mode == "ngm":
+            # NGM mode: no ODE residual; use operator propagation + data loss only.
+            ctx = self._encode_context(x)
+            t = self._time_grid(B, device, dtype)
+            emb = self._node_features(B, device, dtype)
+            inp = self._pack_inputs(t, emb, ctx)
+            flat = inp.view(B * self.H * self.M, -1)
+            params = torch.sigmoid(self.param_net(flat)).view(B, self.H, self.M, 2)
+            beta = params[..., 0]
+            gamma = params[..., 1]
+
+            adj_prob = build_adj_prob(dynamic_graph, graph, B, self.H, self.M, device, dtype)
+            x_last = x[:, -1, :, self.target_idx]
+            y_einn = compute_epi_ngm_forecast(adj_prob=adj_prob, beta=beta, gamma=gamma, x_last=x_last, adj_static=graph)
+
+            losses = {
+                "ode": torch.zeros((), device=device, dtype=dtype),
+                "data": torch.zeros((), device=device, dtype=dtype),
+                "constraint": torch.zeros((), device=device, dtype=dtype),
+                "total": torch.zeros((), device=device, dtype=dtype),
+            }
+            return y_einn, losses
+
+        # SIR modes
+        S, I, R, beta, gamma, t, N_bm = self._states_and_params(x)
+        adj_prob = build_adj_prob(dynamic_graph, graph, B, self.H, self.M, device, dtype)
+        I_mix = self._mix_I(adj_prob, I)
+
+        dS_rhs, dI_rhs, dR_rhs, inf = self._sir_rhs(S, I, R, beta, gamma, I_mix, N_bm)
+
+        dS_dt = self._d_dt(S, t)
+        dI_dt = self._d_dt(I, t)
+        dR_dt = self._d_dt(R, t)
+
+        # ODE residual loss
+        ode_res = (dS_dt - dS_rhs).pow(2) + (dI_dt - dI_rhs).pow(2) + (dR_dt - dR_rhs).pow(2)
+        L_ode = ode_res.mean()
+
+        # Observation/data output (incidence -> target space)
+        y_einn = self._obs_from_incidence(inf, N_bm)
+
+        losses = {
+            "ode": L_ode,
+            "data": torch.zeros((), device=device, dtype=dtype),
+            "constraint": torch.zeros((), device=device, dtype=dtype),
+            "total": torch.zeros((), device=device, dtype=dtype),
+        }
+        return y_einn, losses
+
+    def losses(self, x, y, graph=None, dynamic_graph=None):
+        """
+        Returns:
+          L_ode, L_data, y_einn
+        """
+        y_einn, losses = self.forward(x, graph=graph, dynamic_graph=dynamic_graph)
+
+        # data loss computed here (needs y)
+        if y_einn.shape != y.shape and y_einn.dim() == 3 and y_einn.transpose(1, 2).shape == y.shape:
+            y_einn_aligned = y_einn.transpose(1, 2)
+        else:
+            y_einn_aligned = y_einn
+
+        L_data = F.mse_loss(y_einn_aligned, y)
+
+        L_ode = losses["ode"]
+        total = self.ode_weight * L_ode + self.data_weight * L_data
+
+        return L_ode, L_data, y_einn_aligned
 
 class _FutureTI(nn.Module):
     def __init__(self, tid_sizes, emb_dim=4, hidden=(16,), node_specific=True, num_nodes=None):
@@ -809,6 +1119,82 @@ class BaseModel(nn.Module):
         q = torch.quantile(samples, q=q_tensor, dim=0)
         return q.detach().cpu()
 
+    def compute_crps_wis(
+        self,
+        feature,
+        target,
+        quantile_levels,
+        alphas,
+        graph=None,
+        states=None,
+        dynamic_graph=None,
+        n_samples=100,
+    ):
+        """
+        Compute CRPS and WIS for both unfiltered and filtered residual-bootstrap predictions.
+
+        Notes:
+            - Assumes _fit_conformal(...) has been called to populate residual banks.
+            - If filtered residuals are unavailable, filtered metrics fall back to unfiltered.
+
+        Returns:
+            dict with keys: crps, crps_filtered, wis, wis_filtered (torch scalars).
+        """
+        target = target.to(self.device)
+
+        samples = self.predict_samples(
+            feature,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=False,
+        )
+        samples = samples.reshape(samples.shape[0], *target.shape)
+        crps = crps_ensemble(samples, target)
+
+        samples_filtered = self.predict_samples(
+            feature,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=True,
+        )
+        samples_filtered = samples_filtered.reshape(samples_filtered.shape[0], *target.shape)
+        crps_filtered = crps_ensemble(samples_filtered, target)
+
+        q = self.predict_quantiles(
+            feature,
+            quantile_levels,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=False,
+        )
+        q = q.reshape(q.shape[0], *target.shape)
+        wis = wis_from_quantiles(q, target, alphas=alphas)
+
+        q_filtered = self.predict_quantiles(
+            feature,
+            quantile_levels,
+            graph=graph,
+            states=states,
+            dynamic_graph=dynamic_graph,
+            n_samples=n_samples,
+            filtered=True,
+        )
+        q_filtered = q_filtered.reshape(q_filtered.shape[0], *target.shape)
+        wis_filtered = wis_from_quantiles(q_filtered, target, alphas=alphas)
+
+        return {
+            "crps": crps,
+            "crps_filtered": crps_filtered,
+            "wis": wis,
+            "wis_filtered": wis_filtered,
+        }
+
     def fit(self, 
             train_input, 
             train_target, 
@@ -832,7 +1218,6 @@ class BaseModel(nn.Module):
             batch_size=10,
             lr=1e-3, 
             initialize=True, 
-            verbose=False, 
             patience=100, 
             **kwargs):
         if initialize:
@@ -892,7 +1277,7 @@ class BaseModel(nn.Module):
                     print("Early stopping at epoch: ", epoch)
                     break
 
-                if epoch%10 == 0:
+                if epoch%50 == 0:
                     print(f"######### epoch:{epoch}")
                     print("Training loss: {}".format(training_losses[-1]))
                     print("Validation loss: {}".format(validation_losses[-1]))
@@ -908,12 +1293,12 @@ class BaseModel(nn.Module):
         print("Final Training loss: {}".format(training_losses[-1]))
         print("Final Validation loss: {}".format(validation_losses[-1]))
 
-        plt.figure()
-        plt.plot(training_losses, label="train")
-        plt.plot(validation_losses, label="val")
-        plt.legend()
-        plt.savefig("st_loss.png")
-        plt.show()
+        # plt.figure()
+        # plt.plot(training_losses, label="train")
+        # plt.plot(validation_losses, label="val")
+        # plt.legend()
+        # plt.savefig("st_loss.png")
+        # plt.close()
         
         self.load_state_dict(best_weights)
 
