@@ -48,8 +48,8 @@ def build_splits(lookback=28, horizon=7, train_rate=0.6, val_rate=0.15, permute=
     dataset.graph = torch.FloatTensor(adj_df.to_numpy())
 
     dow = torch.as_tensor(data_df.index.dayofweek.values, dtype=torch.long)
-    woy = torch.as_tensor(data_df.index.isocalendar().week.values - 1, dtype=torch.long)
-    dataset.states = torch.stack([woy], dim=-1)
+    # woy = torch.as_tensor(data_df.index.isocalendar().week.values - 1, dtype=torch.long)
+    dataset.states = torch.stack([dow], dim=-1)
     tid_s = {'dow': 7}
 
     train_dataset, val_dataset, test_dataset = dataset.ganerate_splits(
@@ -366,12 +366,6 @@ def main():
     results = []
 
     model_names = [
-        "Dlinear",
-        "AGCRN",
-        "ColaGNN",
-        "DCRNN",
-        "EpiGNN",
-        "GraphWaveNet",
         "MTGNN",
         "STGCN",
         "GTS",
