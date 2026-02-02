@@ -111,6 +111,128 @@ def build_splits(lookback=12, horizon=4, train_rate=0.6, val_rate=0.15, permute=
     return data_df, dataset.graph, splits, tid_s, train_dataset
 
 
+def build_retraining_splits(
+    lookback=12,
+    horizon=4,
+    min_train_size=None,
+    val_size=None,
+    test_size=None,
+    step_size=None,
+    permute=False,
+):
+    data_df = pd.read_csv("rawData/processed/ILI2019.csv", index_col=0)
+    data_df.index = pd.to_datetime(data_df.index)
+    adj_df = pd.read_csv("rawData/processed/ILI2019_adj.csv", index_col=0)
+
+    dataset = UniversalDataset()
+    data = np.expand_dims(data_df.values, axis=-1)
+    dataset.x = torch.FloatTensor(data)
+    dataset.y = torch.FloatTensor(data)[:, :, 0]
+    dataset.graph = torch.FloatTensor(adj_df.to_numpy())
+
+    woy = torch.as_tensor(data_df.index.isocalendar().week.values - 1, dtype=torch.long)
+    dataset.states = torch.stack([woy], dim=-1)
+    tid_s = {"woy": 53}
+
+    transformed_dataset = dataset.get_transformed()
+    adj_static = transformed_dataset["graph"] if transformed_dataset["graph"] is not None else dataset.graph
+    total_steps = transformed_dataset["features"].shape[0]
+
+    if min_train_size is None:
+        min_train_size = lookback + horizon
+    if val_size is None:
+        val_size = horizon
+    if test_size is None:
+        test_size = horizon
+    if step_size is None:
+        step_size = test_size
+
+    def slice_dataset(start, end):
+        return {
+            "features": transformed_dataset["features"][start:end],
+            "target": transformed_dataset["target"][start:end],
+            "graph": adj_static,
+            "dynamic_graph": None
+            if transformed_dataset["dynamic_graph"] is None
+            else transformed_dataset["dynamic_graph"][start:end],
+            "states": None
+            if transformed_dataset["states"] is None
+            else transformed_dataset["states"][start:end],
+        }
+
+    splits_list = []
+    first_train_dataset = None
+    for train_end in range(min_train_size, total_steps - val_size - test_size + 1, step_size):
+        val_end = train_end + val_size
+        test_end = val_end + test_size
+
+        train_dataset = slice_dataset(0, train_end)
+        val_dataset = slice_dataset(train_end, val_end)
+        test_dataset = slice_dataset(val_end, test_end)
+        if first_train_dataset is None:
+            first_train_dataset = train_dataset
+
+        train_input, train_target, _, train_states_future, train_adj = generate_dataset(
+            X=train_dataset["features"],
+            Y=train_dataset["target"],
+            states=train_dataset["states"],
+            dynamic_adj=train_dataset["dynamic_graph"],
+            lookback_window_size=lookback,
+            horizon_size=horizon,
+            ahead=0,
+            permute=permute,
+        )
+        val_input, val_target, _, val_states_future, val_adj = generate_dataset(
+            X=val_dataset["features"],
+            Y=val_dataset["target"],
+            states=val_dataset["states"],
+            dynamic_adj=val_dataset["dynamic_graph"],
+            lookback_window_size=lookback,
+            horizon_size=horizon,
+            ahead=0,
+            permute=permute,
+        )
+        test_input, test_target, _, test_states_future, test_adj = generate_dataset(
+            X=test_dataset["features"],
+            Y=test_dataset["target"],
+            states=test_dataset["states"],
+            dynamic_adj=test_dataset["dynamic_graph"],
+            lookback_window_size=lookback,
+            horizon_size=horizon,
+            ahead=0,
+            permute=permute,
+        )
+
+        if train_input.numel() == 0 or val_input.numel() == 0 or test_input.numel() == 0:
+            continue
+
+        splits_list.append(
+            {
+                "train": {
+                    "features": train_input,
+                    "targets": train_target,
+                    "states": train_states_future,
+                    "dynamic_graph": train_adj,
+                },
+                "val": {
+                    "features": val_input,
+                    "targets": val_target,
+                    "states": val_states_future,
+                    "dynamic_graph": val_adj,
+                },
+                "test": {
+                    "features": test_input,
+                    "targets": test_target,
+                    "states": test_states_future,
+                    "dynamic_graph": test_adj,
+                },
+                "test_sample_start": val_end,
+            }
+        )
+
+    return data_df, adj_static, splits_list, tid_s, first_train_dataset, dataset
+
+
 def compute_dtw_matrix(train_dataset, dataset_name, cache_dir="."):
     try:
         from fastdtw import fastdtw
@@ -239,6 +361,28 @@ def eval_metrics(pred, target):
     }
 
 
+def eval_horizon_metrics(pred, target, prefix="h"):
+    horizon = target.shape[1]
+    outputs = {}
+    for h in range(horizon):
+        metrics_out = eval_metrics(pred[:, h, :], target[:, h, :])
+        for key, value in metrics_out.items():
+            outputs[f"{prefix}{h + 1}_{key}"] = value
+    return outputs
+
+
+def aggregate_metrics(metrics_list):
+    summary = {}
+    if not metrics_list:
+        return summary
+    keys = metrics_list[0].keys()
+    for key in keys:
+        values = [m[key] for m in metrics_list if key in m]
+        tensors = [v if torch.is_tensor(v) else torch.tensor(v) for v in values]
+        summary[key] = torch.stack(tensors).mean()
+    return summary
+
+
 def run_experiment(
     model_name,
     splits,
@@ -324,6 +468,7 @@ def run_experiment(
 
     targets = splits["test"]["targets"]
     out = eval_metrics(preds, targets)
+    out.update(eval_horizon_metrics(preds, targets))
 
     model._fit_conformal(
         splits["val"]["features"],
@@ -355,13 +500,109 @@ def save_metrics(metrics_out, out_dir, tag):
         f.write(pd.Series(data).to_json())
     return data
 
+
+def run_repeat_last_baseline(split, horizon):
+    test_input = split["test"]["features"]
+    targets = split["test"]["targets"]
+    pred = test_input[:, -1, :, 0].unsqueeze(1).repeat(1, horizon, 1)
+    out = eval_metrics(pred, targets)
+    out.update(eval_horizon_metrics(pred, targets))
+    return out
+
+
+def run_today_shift_baseline(split, extended_target, horizon):
+    targets = split["test"]["targets"]
+    start_idx = split["test_sample_start"]
+    outputs = []
+    for fw_days in range(1, horizon + 1):
+        shifted_start = start_idx - fw_days
+        shifted_end = shifted_start + targets.shape[0]
+        if shifted_start < 0:
+            continue
+        pred = extended_target[shifted_start:shifted_end]
+        out = eval_metrics(pred, targets)
+        out.update(eval_horizon_metrics(pred, targets))
+        out["fw_days"] = fw_days
+        outputs.append(out)
+    return outputs
+
+
+def run_arima_baseline(split, horizon, device):
+    from EpiLearnSpatialTemporal.ARIMA import ARIMA
+
+    model = ARIMA(
+        num_timesteps_input=split["train"]["features"].shape[1],
+        num_timesteps_output=horizon,
+        num_features=1,
+        device=device,
+    )
+    model.fit(
+        train_input=split["train"]["features"],
+        train_target=split["train"]["targets"],
+    )
+    preds = model.predict(split["test"]["features"])
+    targets = split["test"]["targets"]
+    out = eval_metrics(preds, targets)
+    out.update(eval_horizon_metrics(preds, targets))
+    return out
+
+
+def run_retraining_experiment(
+    model_name,
+    splits_list,
+    adj,
+    tid_s,
+    use_future_ti,
+    epi_mode,
+    use_einn,
+    loss_name,
+    horizon,
+    device,
+    dtw_matrix=None,
+    epochs=100,
+):
+    metrics_list = []
+    for split in splits_list:
+        metrics_list.append(
+            run_experiment(
+                model_name=model_name,
+                splits=split,
+                adj=adj,
+                tid_s=tid_s,
+                use_future_ti=use_future_ti,
+                epi_mode=epi_mode,
+                use_einn=use_einn,
+                loss_name=loss_name,
+                horizon=horizon,
+                device=device,
+                dtw_matrix=dtw_matrix,
+                epochs=epochs,
+            )
+        )
+    return aggregate_metrics(metrics_list)
+
 def main():
     dataset_name="ILI2019"
     fix_seed(42)
     device = "cpu"
-    data_df, adj, splits, tid_s, train_dataset = build_splits()
+    lookback = 12
+    horizon = 4
+    data_df, adj, splits_list, tid_s, train_dataset, dataset = build_retraining_splits(
+        lookback=lookback,
+        horizon=horizon,
+    )
+    if not splits_list:
+        raise ValueError("No retraining splits generated; adjust window sizes.")
     adj = adj.type(torch.float)
     dtw_matrix = compute_dtw_matrix(train_dataset, dataset_name=dataset_name)
+    _, extended_target, _, _, _ = generate_dataset(
+        X=dataset.x,
+        Y=dataset.y,
+        lookback_window_size=lookback,
+        horizon_size=horizon,
+        ahead=0,
+        permute=False,
+    )
     out_dir = f"outputs_{dataset_name}"
     results = []
 
@@ -393,16 +634,16 @@ def main():
                         tag = (
                             f"{model_name}|epi={epi_mode}|einn={use_einn}|filter={use_filtering}|ti={use_future_ti}"
                         )
-                        metrics_out = run_experiment(
+                        metrics_out = run_retraining_experiment(
                             model_name=model_name,
-                            splits=splits,
+                            splits_list=splits_list,
                             adj=adj,
                             tid_s=tid_s,
                             use_future_ti=use_future_ti,
                             epi_mode=epi_mode,
                             use_einn=use_einn,
                             loss_name=loss_name,
-                            horizon=splits["train"]["targets"].shape[1],
+                            horizon=horizon,
                             device=device,
                             dtw_matrix=dtw_matrix if model_name == "EARTH" else None,
                         )
@@ -410,6 +651,25 @@ def main():
 
     df = pd.DataFrame(results)
     df.to_csv(os.path.join(out_dir, f"metrics_{dataset_name}.csv"), index=False)
+
+    baseline_results = []
+    repeat_metrics = aggregate_metrics(
+        [run_repeat_last_baseline(split, horizon) for split in splits_list]
+    )
+    baseline_results.append(save_metrics(repeat_metrics, out_dir, "baseline_repeat_last"))
+
+    today_metrics = []
+    for split in splits_list:
+        today_metrics.extend(run_today_shift_baseline(split, extended_target, horizon))
+    for fw_days in range(1, horizon + 1):
+        fw_metrics = [m for m in today_metrics if m.get("fw_days") == fw_days]
+        fw_summary = aggregate_metrics(fw_metrics)
+        baseline_results.append(save_metrics(fw_summary, out_dir, f"baseline_today_fw{fw_days}"))
+
+    arima_metrics = aggregate_metrics(
+        [run_arima_baseline(split, horizon, device) for split in splits_list]
+    )
+    baseline_results.append(save_metrics(arima_metrics, out_dir, "baseline_arima"))
 
 if __name__ == "__main__":
     main()
