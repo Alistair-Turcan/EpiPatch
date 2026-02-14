@@ -36,7 +36,7 @@ def fix_seed(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def build_splits(lookback=28, horizon=7, train_rate=0.6, val_rate=0.15, permute=False):
+def build_splits(lookback=28, horizon=7, train_rate=0.6, val_rate=0.2, permute=False):
     data_df = pd.read_csv("rawData/processed/JHUcase.csv", index_col = 0)
     data_df.index = pd.to_datetime(data_df.index)
     adj_df = pd.read_csv("rawData/processed/JHUcase_adj.csv", index_col = 0)
@@ -366,6 +366,12 @@ def main():
     results = []
 
     model_names = [
+        "Dlinear",
+        "AGCRN",
+        "ColaGNN",
+        "DCRNN",
+        "EpiGNN",
+        "GraphWaveNet",
         "MTGNN",
         "STGCN",
         "GTS",
